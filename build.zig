@@ -7,7 +7,7 @@ pub fn build(b: *Builder) void {
     const exe = b.addExecutable("zerorisc", "src/main.zig");
     exe.setTarget(target);
     exe.setBuildMode(mode);
-    exe.addBuildOption([]const u8, "emulated-arch", "RV32I");
+    exe.addBuildOption([]const u8, "emulated-arch", "RV32IC");
     exe.install();
 
     const run_cmd = exe.run();

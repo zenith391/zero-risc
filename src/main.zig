@@ -95,7 +95,7 @@ pub fn main() anyerror!void {
 
     // Currently it only executes 100 step
     var i: usize = 0;
-    while (i < 100) : (i += 1) {
+    while (i < 1000) : (i += 1) {
         hart.cycle();
     }
 

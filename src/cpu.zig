@@ -4,7 +4,8 @@ pub const arch = Arch.default();
 
 pub const Arch = struct {
     extensions: [255]bool = [1]bool {false} ** 255,
-    XLEN: type = u64,
+    XLEN: type = u32,
+    XLENi: type = i32,
 
     pub fn default() Arch {
         var a = Arch {};
@@ -69,6 +70,14 @@ pub const Hart = struct {
         return if (idx == 0) 0 else self.x[idx];
     }
 
+    inline fn seti_reg(self: *Hart, idx: u5, value: arch.XLENi) void {
+        if (idx != 0) self.x[idx] = @bitCast(arch.XLEN, value);
+    }
+
+    inline fn geti_reg(self: *Hart, idx: u5) arch.XLENi {
+        return if (idx == 0) 0 else @bitCast(arch.XLENi, self.x[idx]);
+    }
+
     fn invalidInstruction(self: *Hart) void {
         @setCold(true);
         const instr = self.memory.readIntLittle(u32, self.pc);
@@ -92,16 +101,16 @@ pub const Hart = struct {
 
         if (opcode == 0b0010011) { // OP-IMM
             // I-type format
-            const imm = instr >> 20;
+            const imm = @bitCast(i12, @intCast(u12, instr >> 20));
             const rs1 = @intCast(u5, (instr >> 15) & 0b11111);
             const funct = (instr >> 12) & 0b111;
 
             if (funct == 0) { // ADDI
                 std.log.debug("ADDI x{}, x{}, {}", .{rd, rs1, imm});
-                self.set_reg(rd, self.get_reg(rs1) + imm);
+                self.seti_reg(rd, self.geti_reg(rs1) +% imm);
             } else if (funct == 7) { // ANDI
                 std.log.debug("ANDI x{}, x{}, 0x{x}", .{rd, rs1, imm});
-                self.set_reg(rd, self.get_reg(rs1) & imm);
+                self.set_reg(rd, self.get_reg(rs1) & @bitCast(u12, imm));
             }
         } else if (opcode == 0b0000011) { // LOAD
             // I-type format
@@ -181,11 +190,21 @@ pub const Hart = struct {
                 self.invalidInstruction();
             }
             compressed = true;
+        } else if (opcode == 0b1101111) { // JAL
+            const imm10_1 = (instr >> 21) & 0b1111111111;
+            const imm11 = (instr >> 19) & 0b1;
+            const imm19_12 = (instr >> 12) & 0b11111111;
+            const imm20 = (instr >> 30) & 0b1;
+            const imm = @bitCast(i21, @intCast(u21, (imm20 << 20) | (imm19_12 << 12) | (imm11 << 11) | (imm10_1 << 1)));
+            std.log.debug("JAL {}", .{imm});
+            self.set_reg(rd, self.pc + 4);
+            self.pc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, imm));
+            jumped = true;
         } else if (opcode == 0b0010111) { // AUIPC
             // U-type format
-            const offset = instr >> 12;
+            const offset = @bitCast(i32, @intCast(u32, instr & 0xFFFFF000));
             std.log.debug("AUIPC x{}, {}", .{rd, offset});
-            self.set_reg(rd, self.pc + (offset << 12));
+            self.seti_reg(rd, @bitCast(arch.XLENi, self.pc) +% offset);
         } else {
             self.invalidInstruction();
         }
