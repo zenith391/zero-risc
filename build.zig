@@ -8,6 +8,10 @@ pub fn build(b: *Builder) void {
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.addBuildOption([]const u8, "emulated-arch", "RV32IC");
+
+    exe.linkSystemLibrary("c");
+    exe.linkSystemLibrary("sdl2");
+
     exe.install();
 
     const run_cmd = exe.run();

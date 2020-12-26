@@ -1,16 +1,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
-pub const arch = Arch.default();
+pub const arch = comptime Arch.default();
 
 pub const Arch = struct {
     extensions: [255]bool = [1]bool {false} ** 255,
     XLEN: type = u32,
     XLENi: type = i32,
+    XLENd: type = u64,
+    XLENb: u8 = 32,
+    vendorId: u32 = 0,
+    archId: u32 = 0xF0000000,
+    implementationId: u32 = 0,
 
     pub fn default() Arch {
         var a = Arch {};
         a.extensions['I'] = true;
         a.extensions['C'] = true;
+        a.extensions['M'] = true;
         return a;
     }
 };
@@ -22,6 +28,10 @@ pub const Memory = struct {
 
     pub inline fn read(self: *Memory, address: usize) u8 {
         return self.readFn(self.userData, address);
+    }
+
+    pub inline fn readi(self: *Memory, address: usize) i8 {
+        return @bitCast(i8, self.readFn(self.userData, address));
     }
 
     pub fn readIntLittle(self: *Memory, comptime T: type, address: usize) T {
@@ -36,6 +46,15 @@ pub const Memory = struct {
 
     pub inline fn write(self: *Memory, address: usize, value: u8) void {
         self.writeFn(self.userData, address, value);
+    }
+
+    pub fn writeIntLittle(self: *Memory, comptime T: type, address: usize, value: T) void {
+        const bytes = @divExact(@typeInfo(T).Int.bits, 8);
+        var data: [bytes]u8 = undefined;
+        std.mem.writeIntLittle(T, &data, value);
+        for (data) |byte, i| {
+            self.write(address + i, byte);
+        }
     }
 
     fn readSlice(userdata: usize, addr: usize) u8 {
@@ -58,9 +77,24 @@ pub const Memory = struct {
 };
 
 pub const Hart = struct {
+    /// x0-31 registers
     x: [32]arch.XLEN = [1]arch.XLEN{0} ** 32,
+    csr: [4096]arch.XLEN = [1]arch.XLEN{0} ** 4096,
     pc: arch.XLEN = 0,
     memory: Memory,
+
+    pub fn init(memory: Memory, pc: arch.XLEN, hartId: arch.XLEN) Hart {
+        var hart = Hart {
+            .memory = memory,
+            .pc = pc
+        };
+        hart.csr[0xF11] = arch.vendorId;
+        hart.csr[0xF12] = arch.archId;
+        hart.csr[0xF13] = arch.implementationId;
+        hart.csr[0xF14] = hartId;
+        // TODO: set misa, mstatus
+        return hart;
+    }
 
     inline fn set_reg(self: *Hart, idx: u5, value: arch.XLEN) void {
         if (idx != 0) self.x[idx] = value;
@@ -82,7 +116,8 @@ pub const Hart = struct {
         @setCold(true);
         const instr = self.memory.readIntLittle(u32, self.pc);
         const opcode = @intCast(u7, instr & 0x7F);
-        std.log.err("Invalid instruction : {x}\n\tOperation Code: {b}", .{instr, opcode});
+        std.log.err("Invalid instruction : {x}\n\tOperation Code: {b}\n\tPC: 0x{x}", .{instr, opcode, self.pc});
+        std.process.exit(1);
     }
 
     pub fn cycle(self: *Hart) void {
@@ -97,7 +132,7 @@ pub const Hart = struct {
         var jumped: bool = false;
 
         //std.log.debug("instr = {x}", .{instr});
-        //std.log.debug("opcode = {b}, pc = {x}", .{opcode, self.pc});
+        std.log.debug("opcode = {b}, pc = {x}", .{opcode, self.pc});
 
         if (opcode == 0b0010011) { // OP-IMM
             // I-type format
@@ -108,19 +143,67 @@ pub const Hart = struct {
             if (funct == 0) { // ADDI
                 std.log.debug("ADDI x{}, x{}, {}", .{rd, rs1, imm});
                 self.seti_reg(rd, self.geti_reg(rs1) +% imm);
-            } else if (funct == 7) { // ANDI
+            } else if (funct == 0b100 ) { // XORI
+                std.log.debug("XORI x{}, x{}, 0x{x}", .{rd, rs1, imm});
+                self.set_reg(rd, self.get_reg(rs1) ^ @bitCast(u12, imm));
+            } else if (funct == 0b110) { // ORI
+                std.log.debug("ORI x{}, x{}, 0x{x}", .{rd, rs1, imm});
+                self.set_reg(rd, self.get_reg(rs1) | @bitCast(u12, imm));
+            } else if (funct == 0b111) { // ANDI
                 std.log.debug("ANDI x{}, x{}, 0x{x}", .{rd, rs1, imm});
                 self.set_reg(rd, self.get_reg(rs1) & @bitCast(u12, imm));
+            } else if (funct == 0b101) { // SRLI / SRAI
+                if ((@bitCast(u12, imm) & 0x800) == 0) { // SRLI
+                    std.log.debug("SRLI x{}, x{}, {}", .{rd, rs1, imm});
+                    self.set_reg(rd, self.get_reg(rs1) >> @intCast(u5, imm));
+                } else {
+                    std.log.err("TODO: SRAI", .{});
+                }
+            } else {
+                std.log.err("OP-IMM funct = {b}", .{funct});
+                self.invalidInstruction();
+            }
+        } else if (opcode == 0b0110011) { // OP
+            const rs1 = @intCast(u5, (instr >> 15) & 0b11111);
+            const rs2 = @intCast(u5, (instr >> 20) & 0b11111);
+            const funct = (((instr >> 25) & 0x7F) << 3) | ((instr >> 12) & 0b111);
+            if (funct == 0b000) { // ADD
+                std.log.debug("ADD x{}, x{}, x{}", .{rd, rs1, rs2});
+                self.set_reg(rd, self.get_reg(rs1) +% self.get_reg(rs2));
+            } else if (funct == 0b1000 and arch.extensions['M']) { // MUL
+                std.log.debug("MUL x{}, x{}, x{}", .{rd, rs1, rs2});
+                self.set_reg(rd, self.get_reg(rs1) *% self.get_reg(rs2));
+            } else if (funct == 0b1011 and arch.extensions['M']) { // MULHU
+                std.log.debug("MULHU x{}, x{}, x{}", .{rd, rs1, rs2});
+                const multiplier = @intCast(arch.XLENd, self.get_reg(rs1));
+                const multiplicand = @intCast(arch.XLENd, self.get_reg(rs2));
+                const result = @intCast(arch.XLEN, ((multiplier * multiplicand) & (std.math.maxInt(arch.XLEN) << arch.XLENb)) >> arch.XLENb);
+                self.set_reg(rd, result);
+                //std.process.exit(1);
+            } else {
+                self.invalidInstruction();
             }
         } else if (opcode == 0b0000011) { // LOAD
             // I-type format
-            const offset = instr >> 20;
+            const offset = @bitCast(i12, @intCast(u12, instr >> 20));
             const rs1 = @intCast(u5, (instr >> 15) & 0b11111);
             const funct = (instr >> 12) & 0b111;
-            const addr = self.get_reg(rs1) + offset;
-            if (funct == 4) { // LBU
+            const addr = @bitCast(u32, self.geti_reg(rs1) +% offset);
+            if (funct == 0) { // LB
+                std.log.debug("LB x{}, x{}, {}", .{rd, rs1, offset});
+                self.seti_reg(rd, @intCast(i32, self.memory.readi(addr)));
+            } else if (funct == 1) { // LH
+                std.log.debug("LH x{}, x{}, {}", .{rd, rs1, offset});
+                self.seti_reg(rd, @intCast(i32, self.memory.readIntLittle(i16, addr)));
+            } else if (funct == 2) { // LW
+                std.log.debug("LW x{}, x{}, {}", .{rd, rs1, offset});
+                self.set_reg(rd, self.memory.readIntLittle(u32, addr));
+            } else if (funct == 4) { // LBU
                 std.log.debug("LBU x{}, x{}, 0x{x}", .{rd, rs1, offset});
                 self.set_reg(rd, self.memory.read(addr));
+            } else if (funct == 5) { // LHU
+                std.log.debug("LHU x{}, x{}, 0x{x}", .{rd, rs1, offset});
+                self.set_reg(rd, self.memory.readIntLittle(u16, addr));
             } else {
                 self.invalidInstruction();
             }
@@ -130,34 +213,66 @@ pub const Hart = struct {
             const rs2 = @intCast(u5, (instr >> 20) & 0b11111);
             const imm11_5 = (instr >> 25) & 0b1111111;
             const imm4_0 = (instr >> 7) & 0b11111;
-            const offset = (imm11_5 << 5) | imm4_0;
-            const addr = self.get_reg(rs1) + offset;
+            const offset = @bitCast(i12, @intCast(u12, (imm11_5 << 5) | imm4_0));
+            const addr = @bitCast(u32, @bitCast(i32, self.get_reg(rs1)) +% offset);
 
             if (funct == 0) { // SB
-                std.log.debug("SB x{}, x{}, 0x{x}", .{rs1, rs2, offset});
+                std.log.debug("SB {}(x{}), x{}", .{offset, rs1, rs2});
                 self.memory.write(addr, @intCast(u8, self.get_reg(rs2) & 0xFF));
+            } else if (funct == 1) { // SH
+                std.log.debug("SH {}(x{}), x{}", .{offset, rs1, rs2});
+                self.memory.writeIntLittle(u32, addr, @intCast(u16, self.get_reg(rs2) & 0xFFFF));
+            } else if (funct == 2) { // SW
+                std.log.debug("SW {}(x{}), x{}", .{offset, rs1, rs2});
+                self.memory.writeIntLittle(u32, addr, self.get_reg(rs2));
             } else {
                 self.invalidInstruction();
             }
         } else if (opcode == 0b1100011) { // BRANCH
             const funct = (instr >> 12) & 0b111;
-            const rs1 = self.get_reg(@intCast(u5, (instr >> 15) & 0b11111));
-            const rs2 = self.get_reg(@intCast(u5, (instr >> 20) & 0b11111));
-            const imm11 = (instr >> 6) & 0b1;
+            const rs1 = @intCast(u5, (instr >> 15) & 0b11111);
+            const rs2 = @intCast(u5, (instr >> 20) & 0b11111);
+            const imm11 = (instr >> 7) & 0b1;
             const imm12 = (instr >> 30) & 0b1;
             const imm4_1 = (instr >> 8) & 0b1111;
             const imm10_5 = (instr >> 25) & 0b111111;
-            const offset = @bitCast(i12, @intCast(u12, (imm12 << 11) | (imm11 << 10) | (imm10_5 << 4) | imm4_1));
-            if (funct == 0b001) { // BNE
-                std.log.debug("BNE x{}, x{}, {}", .{rs1, rs2, offset});
-                if (rs1 != rs2) {
-                    self.pc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, offset)*2);
+            const offset = @bitCast(i13, @intCast(u13, (imm12 << 12) | (imm11 << 11) | (imm10_5 << 5) | (imm4_1 << 1)));
+            const newPc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, offset));
+
+            if (funct == 0b000) { // BEQ
+                std.log.debug("BEQ x{}, x{}, 0x{x}", .{rs1, rs2, newPc});
+                if (self.get_reg(rs1) == self.get_reg(rs2)) {
+                    self.pc = newPc;
                     jumped = true;
                 }
-            } else if (funct == 0b000) { // BEQ
-                std.log.debug("BEQ x{}, x{}, {}", .{rs1, rs2, offset});
-                if (rs1 == rs2) {
-                    self.pc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, offset)*2);
+            } else if (funct == 0b001) { // BNE
+                std.log.debug("BNE x{}, x{}, 0x{x}", .{rs1, rs2, newPc});
+                if (self.get_reg(rs1) != self.get_reg(rs2)) {
+                    self.pc = newPc;
+                    jumped = true;
+                }
+            } else if (funct == 0b100) { // BLT
+                std.log.debug("BLT x{}, x{}, 0x{x}", .{rs1, rs2, newPc});
+                if (self.geti_reg(rs1) < self.geti_reg(rs2)) {
+                    self.pc = newPc;
+                    jumped = true;
+                }
+            } else if (funct == 0b101) { // BGE
+                std.log.debug("BGE x{}, x{}, 0x{x}", .{rs1, rs2, newPc});
+                if (self.geti_reg(rs1) > self.geti_reg(rs2)) {
+                    self.pc = newPc;
+                    jumped = true;
+                }
+            } else if (funct == 0b110) { // BLTU
+                std.log.debug("BLTU x{}, x{}, 0x{x}", .{rs1, rs2, newPc});
+                if (self.get_reg(rs1) < self.get_reg(rs2)) {
+                    self.pc = newPc;
+                    jumped = true;
+                }
+            } else if (funct == 0b111) { // BGEU
+                std.log.debug("BGEU x{}, x{}, 0x{x}", .{rs1, rs2, newPc});
+                if (self.get_reg(rs1) > self.get_reg(rs2)) {
+                    self.pc = newPc;
                     jumped = true;
                 }
             } else {
@@ -167,9 +282,55 @@ pub const Hart = struct {
             const funct = (instr >> 13) & 0b111;
             if (funct == 0b000) { // C.ADDI
                 const imm5 = (instr >> 12) & 0b1;
-                const imm = (instr >> 2) & 0b11111 + (imm5 << 5);
+                const imm = @bitCast(i6, @intCast(u6, ((instr >> 2) & 0b11111) + (imm5 << 5)));
                 std.log.debug("C.ADDI x{}, x{}, {}", .{rd, rd, imm});
-                self.set_reg(rd, self.get_reg(rd) + imm);
+                self.seti_reg(rd, self.geti_reg(rd) +% imm);
+            } else if (funct == 0b010) { // C.LI
+                const imm40 = (instr >> 2) & 0b11111;
+                const imm5 = (instr >> 11) & 0b1;
+                const imm = @bitCast(i6, @intCast(u6, (imm5 << 4) | imm40));
+                std.log.debug("C.LI x{}, {} = ADDI x{}, x0, {}", .{rd, imm, rd, imm});
+                self.seti_reg(rd, imm);
+            } else if (funct == 0b011) {
+                if (rd == 2) { // C.ADDI16SP
+                    const imm9 = (instr >> 12) & 0b1;
+                    const imm5 = (instr >> 2) & 0b1;
+                    const imm87 = (instr >> 3) & 0b11;
+                    const imm6 = (instr >> 5) & 0b1;
+                    const imm4 = (instr >> 6) & 0b1;
+                    const imm = @bitCast(i10, @intCast(u10, (imm9 << 9) | (imm87 << 7) | (imm6 << 6) | (imm5 << 5) | (imm4 << 4)));
+                    std.log.debug("C.ADDI16SP {} = ADDI x2, x2, {}", .{imm, imm});
+                    self.seti_reg(2, self.geti_reg(2) + imm);
+                } else { // C.LUI
+                    const imm40 = (instr >> 2) & 0b11111;
+                    const imm5 = (instr >> 11) & 0b1;
+                    const imm = ((imm5 << 4) | imm40) << 12;
+                    std.log.debug("C.LUI x{}, {}", .{rd, imm});
+                    self.set_reg(rd, imm);
+                }
+            } else if (funct == 0b100) {
+                const funct2 = (instr >> 10) & 0b11;
+                const imm5 = (instr >> 12) & 0b1;
+                const imm40 = (instr >> 2) & 0b11111;
+                const imm = (imm5 << 5) | imm40;
+                const rD = @intCast(u5, (instr >> 2) & 0b111) + 8;
+                if (funct2 == 0b00 and imm != 0) {
+                    std.log.debug("C.SRLI x{}, 0x{x} = SRLI x{}, x{}, {}", .{rD, imm, rD, rD, imm});
+                    self.set_reg(rD, self.get_reg(rD) >> @intCast(u5, imm));
+                } else if (funct2 == 0b11) {
+                    const functs = (instr >> 5) & 0b11;
+                    const rD2 = @intCast(u5, (instr >> 7) & 0b111) + 8;
+                    const rs2 = @intCast(u5, (instr >> 2) & 0b111) + 8 - 1;
+                    if (imm5 == 0 and functs == 0b00) { // C.SUB
+                        std.log.debug("C.SUB x{}, x{} = SUB x{}, x{}, x{}", .{rD2, rs2, rD2, rD2, rs2});
+                        //std.log.debug("x{} = x{}, x{} = {}", .{rD2, self.get_reg()})
+                        self.set_reg(rD2, self.get_reg(rD2) - self.get_reg(rs2));
+                    } else {
+                        self.invalidInstruction();
+                    }
+                } else {
+                    self.invalidInstruction();
+                }
             } else if (funct == 0b101) { // C.J
                 const imm11 = (instr >> 12) & 0b1;
                 const imm4 = (instr >> 11) & 0b1;
@@ -180,13 +341,118 @@ pub const Hart = struct {
                 const imm31 = (instr >> 3) & 0b111;
                 const imm5 = (instr >> 2) & 0b1;
 
-                const imm = @bitCast(i12, @intCast(u12, (imm11 << 10) | (imm10 << 9) | (imm98 << 7) |
-                    (imm7 << 6) | (imm6 << 5) | (imm5 << 4) | (imm4 << 3) | imm31));
-                std.log.debug("C.J {}", .{imm});
-                self.pc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, imm));
+                const imm = @bitCast(i12, @intCast(u12, (imm11 << 11) | (imm10 << 10) | (imm98 << 8) |
+                    (imm7 << 7) | (imm6 << 6) | (imm5 << 5) | (imm4 << 4) | (imm31 << 1)));
+                const newPc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, imm));
+                std.log.debug("C.J 0x{x} = JAL x0, 0x{x}", .{newPc, newPc});
+                self.pc = newPc;
                 jumped = true;
+            } else if (funct == 0b111) { // C.BNEZ
+                const rs1 = rd + 8; // @intCast(u5, (instr >> 7) & 0b111) + 8;
+                const imm5 =  (instr >> 2) & 0b1;
+                const imm21 = (instr >> 3) & 0b11;
+                const imm76 = (instr >> 5) & 0b11;
+                const imm43 = (instr >> 10) & 0b11;
+                const imm8 =  (instr >> 12) & 0b1;
+                const imm = @bitCast(i9, @intCast(u9, (imm76 << 6) | (imm5 << 5) | (imm43 << 3) | (imm21 << 1)));
+                const newPc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, imm));
+                std.log.debug("C.BNEZ x{}, 0x{x} = BNE x{}, x0, 0x{x}", .{rs1, newPc, rs1, newPc});
+                if (self.get_reg(rs1) != 0) {
+                    jumped = true;
+                    self.pc = newPc;
+                }
             } else {
-                std.log.err("Unknown compressed opcode, funct = {b}", .{funct});
+                std.log.err("Unknown compressed opcode, op = 01, funct = {b}", .{funct});
+                self.invalidInstruction();
+            }
+            compressed = true;
+        } else if ((opcode & 0x3) == 0b00 and arch.extensions['C']) { // compressed instructions ('C' extension)
+            const funct = (instr >> 13) & 0b111;
+            if (funct == 0b000) { // C.ADDI4SPN
+                const imm3 = (instr >> 5) & 0b1;
+                const imm2 = (instr >> 6) & 0b1;
+                const imm96 = (instr >> 7) & 0b1111;
+                const imm54 = (instr >> 11) & 0b11;
+                const imm = (imm96 << 6) | (imm54 << 4) | (imm3 << 3) | (imm2 << 2);
+                const rD = @intCast(u5, (instr >> 2) & 0b111) + 8;
+                std.log.debug("C.ADDI4SPN x{}, {} = ADDI x{}, x2, {}", .{rD, imm, rD, imm});
+                self.set_reg(rD, self.get_reg(2) +% imm);
+            } else if (funct == 0b010) { // C.LW
+                const rs1 = @intCast(u5, (instr >> 7) & 0b111) + 8;
+                const rD = @intCast(u5, (instr >> 2) & 0b111) + 8;
+                const imm2 = (instr >> 6) & 0b1;
+                const imm6 = (instr >> 5) & 0b1;
+                const imm53 = (instr >> 10) & 0b111;
+                const imm = (imm6 << 6) | (imm53 << 3) | (imm2 << 2);
+                const addr = self.get_reg(rs1) + imm;
+                std.log.debug("C.LW x{}, {}(x{})", .{rD, imm, rs1});
+                self.set_reg(rD, self.memory.readIntLittle(u32, addr));
+            } else if (funct == 0b110) { // C.SW
+                const rs1 = rd + 8; // @intCast(u5, (instr >> 7) & 0b111) + 8;
+                const rs2 = @intCast(u5, (instr >> 2) & 0b111) + 8;
+                const imm2 = (instr >> 6) & 0b1;
+                const imm6 = (instr >> 5) & 0b1;
+                const imm53 = (instr >> 10) & 0b111;
+                const imm = (imm6 << 6) | (imm53 << 3) | (imm2 << 2);
+                const addr = self.get_reg(rs1) + imm;
+                std.log.debug("C.SW x{}, {}(x{})", .{rs2, imm, rs1});
+                self.memory.writeIntLittle(u32, addr, self.get_reg(rs2));
+            } else {
+                std.log.err("Unknown compressed opcode, op = 00, funct = {b}", .{funct});
+                self.invalidInstruction();
+            }
+            compressed = true;
+        } else if ((opcode & 0x3) == 0b10 and arch.extensions['C']) { // compressed instructions ('C' extension)
+            const funct = (instr >> 13) & 0b111;
+            if (funct == 0b110) { // C.SWSP
+                const rs2 = @intCast(u5, (instr >> 2) & 0b11111);
+                const imm76 = (instr >> 7) & 0b11;
+                const imm52 = (instr >> 9) & 0b1111;
+                const imm = (imm76 << 6) | (imm52 << 2);
+                std.log.debug("C.SWSP x{}, {} = SW x{}, {}(x2)", .{rs2, imm, rs2, imm});
+                self.memory.writeIntLittle(u32, self.get_reg(2) + imm, self.get_reg(rs2));
+            } else if (funct == 0b010) { // C.LWSP
+                const imm76 = (instr >> 2) & 0b11;
+                const imm5 = (instr >> 12) & 0b1;
+                const imm42 = (instr >> 4) & 0b111;
+                const imm = (imm76 << 6) | (imm5 << 5) | (imm42 << 2);
+                std.log.debug("C.LWSP x{}, {} {b} {b} {b} = LW x{}, {}(x2)", .{rd, imm, imm76, imm5, imm42, rd, imm});
+                self.set_reg(rd, self.memory.readIntLittle(u32, self.get_reg(2) + imm));
+            } else if (funct == 0b100) {
+                const funct4 = (instr >> 12) & 0b1;
+                if (funct4 == 0) { // C.MV
+                    const rs2 = @intCast(u5, (instr >> 2) & 0b11111);
+                    if (rs2 == 0) {
+                        const rs1 = rd; // = @intCast(u5, (instr >> 7) & 0b11111)
+                        if (rs1 != 0) { // C.JR
+                            std.log.debug("C.JR x{} = JALR x0, 0(x{})", .{rs1, rs1});
+                            self.pc = self.get_reg(rs1);
+                            jumped = true;
+                        } else {
+                            std.log.err("Invalid compressed opcode, op = 10, funct = {b}", .{funct});
+                            self.invalidInstruction();
+                        }
+                    } else { // C.MV
+                        std.log.debug("C.MV x{}, x{} = ADD x{}, x0, x{}", .{rd, rs2, rd, rs2});
+                        self.set_reg(rd, self.get_reg(rs2));
+                    }
+                } else {
+                    const rs2 = @intCast(u5, (instr >> 2) & 0b11111);
+                    if (rs2 == 0) {
+                        const rs1 = rd; // = @intCast(u5, (instr >> 7) & 0b11111)
+                        if (rs1 == 0) {
+                            std.log.err("TODO: C.EBREAK", .{});
+                            std.process.exit(0);
+                        } else {
+                            std.log.err("TODO: C.JALR", .{});
+                        }
+                    } else { // C.ADD
+                        std.log.debug("C.ADD x{}, x{} = ADD x{}, x{}, x{}", .{rd, rs2, rd, rd, rs2});
+                        self.set_reg(rd, self.get_reg(rd) +% self.get_reg(rs2));
+                    }
+                }
+            } else {
+                std.log.err("Unknown compressed opcode, op = 10, funct = {b}", .{funct});
                 self.invalidInstruction();
             }
             compressed = true;
@@ -196,15 +462,29 @@ pub const Hart = struct {
             const imm19_12 = (instr >> 12) & 0b11111111;
             const imm20 = (instr >> 30) & 0b1;
             const imm = @bitCast(i21, @intCast(u21, (imm20 << 20) | (imm19_12 << 12) | (imm11 << 11) | (imm10_1 << 1)));
-            std.log.debug("JAL {}", .{imm});
+            const newPc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, imm));
+            std.log.debug("JAL x{}, 0x{x}", .{rd, imm});
             self.set_reg(rd, self.pc + 4);
-            self.pc = @intCast(u32, @intCast(i33, self.pc) + @intCast(i33, imm));
+            self.pc = newPc;
+            jumped = true;
+        } else if (opcode == 0b1100111) { // JALR
+            const imm = @bitCast(i12, @intCast(u12, (instr >> 20)));
+            const rs1 = @intCast(u5, (instr >> 15) & 0b11111);
+            const newPc = @intCast(u32, self.geti_reg(rs1) +% imm);
+            std.log.debug("JALR x{}, {}(x{})", .{rd, imm, rs1});
+            self.set_reg(rd, self.pc + 4);
+            self.pc = newPc;
             jumped = true;
         } else if (opcode == 0b0010111) { // AUIPC
             // U-type format
             const offset = @bitCast(i32, @intCast(u32, instr & 0xFFFFF000));
             std.log.debug("AUIPC x{}, {}", .{rd, offset});
             self.seti_reg(rd, @bitCast(arch.XLENi, self.pc) +% offset);
+        } else if (opcode == 0b0110111) { // LUI
+            // U-type format
+            const imm = @intCast(u32, instr & 0xFFFFF000);
+            std.log.debug("LUI x{}, 0x{x}", .{rd, (imm>>12)});
+            self.set_reg(rd, imm);
         } else {
             self.invalidInstruction();
         }
