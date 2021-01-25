@@ -5,9 +5,10 @@ const c = @cImport({
 });
 const Allocator = std.mem.Allocator;
 
-pub const log_level = .notice;
+pub const log_level = .info;
 
 var screen: [0x4000]u8 = undefined;
+var running: bool = true;
 
 fn readSlice(userdata: usize, addr: usize) u8 {
     const slice = @intToPtr(*[]u8, userdata);
@@ -15,12 +16,83 @@ fn readSlice(userdata: usize, addr: usize) u8 {
     return slice.*[addr];
 }
 
+const GpuMode = enum {
+    /// 80x25
+    Text,
+    Graphics
+};
+
+/// GPU operation start at 0xBD800, flush by writing at 0xBD7FF
+const GpuOp = union(enum) {
+    SetMode: union(GpuMode) {
+        Text,
+        Graphics: packed struct { width: u32, height: u32 }
+    },
+    Fill: packed struct {
+        x: u16, y: u16,
+        w: u16, h: u16,
+        rgb: u32
+    }
+};
+
+var currentMode = GpuMode.Text;
+var gSurface: *c.SDL_Surface = undefined;
+var gTexture: *c.SDL_Texture = undefined;
 fn writeSlice(userdata: usize, addr: usize, value: u8) void {
-    //std.debug.warn("store to 0x{x}\n", .{addr});
-    if (addr >= 0xB8000 and addr <= 0xB8000+0x4000) {
+    var slice = @intToPtr(*[]u8, userdata);
+    if (addr == 0xBD7FF) {
+        const op = @ptrCast(*GpuOp, slice.*[0xBD800..].ptr);
+        switch (op.*) {
+            .SetMode => |sm| {
+                switch (sm) {
+                    .Text => |t| {
+                        std.log.info("set text to 80x25", .{});
+                        _ = c.SDL_RenderClear(renderer);
+                    },
+                    .Graphics => |g| {
+                        std.log.info("set graphics to {}x{}", .{g.width, g.height});
+                        c.SDL_SetWindowSize(window, @intCast(c_int, g.width), @intCast(c_int, g.height));
+                        const vp = c.SDL_Rect {
+                            .x = 0, .y = 0,
+                            .w = @intCast(c_int, g.width), .h = @intCast(c_int, g.height)
+                        };
+                        gTexture = c.SDL_CreateTexture(renderer, c.SDL_PIXELFORMAT_RGB24, c.SDL_TEXTUREACCESS_TARGET,
+                            @intCast(c_int, g.width), @intCast(c_int, g.height)) orelse unreachable;
+                    }
+                }
+            },
+            .Fill => |cmd| {
+                //std.log.info("fill {}x{} rectangle at {}x{} with color {x}", .{cmd.w, cmd.h, cmd.x, cmd.y, cmd.rgb});
+
+                const rect = c.SDL_Rect {
+                    .x = cmd.x, .y = cmd.y,
+                    .w = cmd.w, .h = cmd.h
+                };
+                _ = c.SDL_RenderClear(renderer);
+                _ = c.SDL_SetRenderTarget(renderer, gTexture);
+                _ = c.SDL_SetRenderDrawColor(renderer, @truncate(u8, cmd.rgb >> 16),
+                    @truncate(u8, cmd.rgb >> 8), @truncate(u8, cmd.rgb), 0xFF);
+                _ = c.SDL_RenderFillRect(renderer, &rect);
+                _ = c.SDL_SetRenderTarget(renderer, null);
+                _ = c.SDL_RenderCopy(renderer, gTexture, null, null);
+                c.SDL_RenderPresent(renderer);
+            }
+        }
+    } else if (addr >= 0xB8000 and addr <= 0xB8000+0x4000) {
         screen[addr - 0xB8000] = value;
+        if (currentMode == .Text) {
+            _ = c.SDL_RenderClear(renderer);
+            var x: usize = 0;
+            while (x < 80) : (x += 1) {
+                var y: usize = 0;
+                while (y < 25) : (y += 1) {
+                    const pos = x+y*80;
+                    font.drawChar(x*8, y*16, screen[pos]);
+                }
+            }
+            c.SDL_RenderPresent(renderer);
+        }
     } else {
-        var slice = @intToPtr(*[]u8, userdata);
         slice.*[addr] = value;
     }
 }
@@ -33,11 +105,44 @@ pub fn defaultMemory(ram: *[]u8) cpu.Memory {
     };
 }
 
+fn ecall(hart: *cpu.Hart) void {
+    const number = hart.x[17];
+    switch (number) {
+        64 => { // write
+            const fd = hart.x[10];
+            const ptr = hart.x[11];
+            const count = hart.x[12];
+            std.log.scoped(.syscall).debug("write({}, ..., {})", .{fd, count});
+            if (fd == 1) { // == STDOUT_FILENO
+                var buf: [256]u8 = undefined;
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    buf[i] = hart.memory.read(ptr + i);
+                }
+                const ret = std.io.getStdOut().write(buf[0..count]) catch unreachable; // TODO: handle error
+                hart.x[10] = @truncate(u32, ret); // it is impossible to have written more than count which is 32 bits.
+            }
+        },
+        else => std.log.crit("Unknown syscall: {}", .{number})
+    }
+}
+
 fn usage() !void {
     var stderr = std.io.getStdErr().writer();
     try stderr.writeAll("Usage: zerorisc {help | [file]}\n");
     std.process.exit(1);
 }
+
+fn hartMain(hart: *cpu.Hart) !void {
+    while (running) {
+        hart.cycle();
+        std.time.sleep(1000000);
+    }
+}
+
+var window: *c.SDL_Window = undefined;
+var renderer: *c.SDL_Renderer = undefined;
+var font: Font = undefined;
 
 pub fn main() anyerror!void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}) {};
@@ -67,13 +172,14 @@ pub fn main() anyerror!void {
     }
 
     var file = std.fs.cwd().openFile(filePath, .{ .read = true }) catch |err| {
-        std.debug.warn("Could not open '{}', got {} error.\n", .{filePath, @errorName(err)});
+        std.debug.warn("Could not open '{s}', got {s} error.\n", .{filePath, @errorName(err)});
         std.process.exit(1);
     };
+    var useSDL: bool = false;
     defer file.close();
 
     // Allocate memory
-    var ram = try allocator.alignedAlloc(u8, 16, 128 * 1024); // big alignment for better performance
+    var ram = try allocator.alignedAlloc(u8, 16, 64 * 128 * 1024); // big alignment for better performance
     defer allocator.free(ram);
     var memory = defaultMemory(&ram);
 
@@ -93,50 +199,47 @@ pub fn main() anyerror!void {
         }
     }
 
+    // Initialise the RISC-V hart
+    var hart = cpu.Hart.init(memory, @intCast(u32, header.entry), 0);
+    hart.ecallFn = ecall;
+    hart.x[2] = 0x512; // set sp
+
     _ = c.SDL_Init(c.SDL_INIT_VIDEO);
     defer c.SDL_Quit();
 
-    const window = c.SDL_CreateWindow("Zero RISC", c.SDL_WINDOWPOS_CENTERED, c.SDL_WINDOWPOS_CENTERED, 8*80, 16*25, 0).?;
+    window = c.SDL_CreateWindow("Zero RISC", c.SDL_WINDOWPOS_CENTERED, c.SDL_WINDOWPOS_CENTERED, 8*80, 16*25, 0).?;
     defer c.SDL_DestroyWindow(window);
 
-    const renderer = c.SDL_CreateRenderer(window, -1, 0).?;
+    renderer = c.SDL_CreateRenderer(window, -1, 0).?;
     defer c.SDL_DestroyRenderer(renderer);
 
     const fontFile = try std.fs.cwd().openFile("unifont.hex", .{ .read = true });
-    const font = try loadHexFont(allocator, renderer, fontFile);
+    font = try loadHexFont(allocator, fontFile);
     fontFile.close();
 
-    // Initialise the RISC-V hart
-    var hart = cpu.Hart.init(memory, @intCast(u32, header.entry), 0);
-    hart.x[2] = 0x512; // set sp
+    var thread = try std.Thread.spawn(&hart, hartMain);
 
-    var i: usize = 0;
-    while (i < 4000) : (i += 1) {
+    while (true) {
         var event: c.SDL_Event = undefined;
         if (c.SDL_PollEvent(&event) != 0) {
             if (event.type == c.SDL_QUIT) {
                 break;
+            } else if (event.type == c.SDL_MOUSEMOTION) {
+                const mouse = event.motion;
+                memory.writeIntLittle(u16, 0xD0000, @intCast(u16, mouse.x));
+                memory.writeIntLittle(u16, 0xD0002, @intCast(u16, mouse.y));
             }
         }
-        hart.cycle();
-
-        _ = c.SDL_RenderClear(renderer);
-        var x: usize = 0;
-        while (x < 80) : (x += 1) {
-            var y: usize = 0;
-            while (y < 25) : (y += 1) {
-                const pos = x+y*80;
-                font.drawChar(x*8, y*16, screen[pos]);
-            }
-        }
-        c.SDL_RenderPresent(renderer);
+        //c.SDL_RenderPresent(renderer);
     }
+    running = false;
+    thread.wait();
 
-    // Print the first 16 registers (x0-x15) as debug.
-    i = 0;
+    // Print the registers (x0-x31) as debug.
+    var i: usize = 0;
     while (i < 32) : (i += 1) {
         var str = [1]u8 {@intCast(u8, hart.x[i] & 0xFF)};
-        std.log.debug("x{} = 0x{x} = {}", .{i, hart.x[i], str});
+        std.log.debug("x{} = 0x{x} = {s}", .{i, hart.x[i], str});
     }
 }
 
@@ -161,13 +264,13 @@ const Font = struct {
     }
 };
 
-fn loadHexFont(allocator: *Allocator, renderer: *c.SDL_Renderer, file: std.fs.File) !Font {
+fn loadHexFont(allocator: *Allocator, file: std.fs.File) !Font {
     var reader = file.reader();
     var total: c_int = 0;
     var totalBitmap: []u8 = try allocator.alloc(u8, 0);
 
     while (true) {
-        const line = try reader.readUntilDelimiterOrEofAlloc(allocator, '\n', std.math.maxInt(usize));
+        const line = (try reader.readUntilDelimiterOrEofAlloc(allocator, '\n', std.math.maxInt(usize))) orelse break;
         defer allocator.free(line);
         if (line.len == 0) break;
         total += 1;

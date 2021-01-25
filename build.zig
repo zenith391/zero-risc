@@ -8,10 +8,8 @@ pub fn build(b: *Builder) void {
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.addBuildOption([]const u8, "emulated-arch", "RV32IC");
-
     exe.linkSystemLibrary("c");
     exe.linkSystemLibrary("sdl2");
-
     exe.install();
 
     const run_cmd = exe.run();
@@ -22,4 +20,5 @@ pub fn build(b: *Builder) void {
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+    run_step.dependOn(b.default_step);
 }
