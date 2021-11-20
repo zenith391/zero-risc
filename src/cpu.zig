@@ -236,6 +236,11 @@ pub const Hart = struct {
                     const multiplier = self.get_reg(rs2);
                     const result = @intCast(arch.XLEN, std.math.mulWide(arch.XLEN, multiplicand, multiplier) >> arch.XLENb);
                     self.set_reg(rd, result);
+                } else if (comptime riscv.featureSetHas(arch.features, .m) and funct == 0b1101) { // DIVU
+                    std.log.debug("DIVU x{}, x{}, x{}", .{rd, rs1, rs2});
+                    const dividend = self.get_reg(rs1);
+                    const divisor = self.get_reg(rs2);
+                    self.set_reg(rd, dividend / divisor);
                 } else if (comptime riscv.featureSetHas(arch.features, .m) and funct == 0b1111) { // REMU
                     std.log.debug("REMU x{}, x{}, x{}", .{rd, rs1, rs2});
                     const dividend = self.get_reg(rs1);
