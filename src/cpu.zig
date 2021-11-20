@@ -331,7 +331,7 @@ pub const Hart = struct {
                     }
                 } else if (funct == 0b101) { // BGE
                     std.log.debug("BGE x{}, x{}, 0x{x}", .{rs1, rs2, newPc});
-                    if (self.geti_reg(rs1) > self.geti_reg(rs2)) {
+                    if (self.geti_reg(rs1) >= self.geti_reg(rs2)) {
                         self.pc = newPc;
                         jumped = true;
                     }
@@ -343,7 +343,7 @@ pub const Hart = struct {
                     }
                 } else if (funct == 0b111) { // BGEU
                     std.log.debug("BGEU x{}, x{}, 0x{x}", .{rs1, rs2, newPc});
-                    if (self.get_reg(rs1) > self.get_reg(rs2)) {
+                    if (self.get_reg(rs1) >= self.get_reg(rs2)) {
                         self.pc = newPc;
                         jumped = true;
                     }
@@ -369,7 +369,7 @@ pub const Hart = struct {
                 const newPc = @intCast(u32, self.geti_reg(rs1) +% imm);
                 std.log.debug("JALR x{}, {}(x{})", .{rd, imm, rs1});
                 self.set_reg(rd, self.pc + 4);
-                self.pc = newPc;
+                self.pc = newPc & ~@as(arch.XLEN, 1);
                 jumped = true;
             },
             0b0010111 => { // AUIPC
@@ -605,7 +605,11 @@ pub const Hart = struct {
                                     @breakpoint();
                                     //std.process.exit(0);
                                 } else {
-                                    std.log.err("TODO: C.JALR", .{});
+                                    std.log.debug("C.JALR x{} = JALR x1, 0(x{})", .{ rs1, rs1 });
+                                    const next = self.pc + 2;
+                                    self.pc = self.get_reg(rs1);
+                                    self.set_reg(1, next);
+                                    jumped = true;
                                 }
                             } else { // C.ADD
                                 std.log.debug("C.ADD x{}, x{} = ADD x{}, x{}, x{}", .{rd, rs2, rd, rd, rs2});
