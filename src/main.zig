@@ -9,6 +9,7 @@ pub const log_level = .info;
 
 var screen: [0x4000]u8 = undefined;
 var running: bool = true;
+var renderLock = std.Thread.Mutex {};
 
 fn readSlice(userdata: usize, addr: usize) u8 {
     const slice = @intToPtr(*[]u8, userdata);
@@ -36,7 +37,6 @@ const GpuOp = union(enum) {
 };
 
 var currentMode = GpuMode.Text;
-var gSurface: *c.SDL_Surface = undefined;
 var gTexture: *c.SDL_Texture = undefined;
 fn writeSlice(userdata: usize, addr: usize, value: u8) void {
     var slice = @intToPtr(*[]u8, userdata);
@@ -45,52 +45,62 @@ fn writeSlice(userdata: usize, addr: usize, value: u8) void {
         switch (op.*) {
             .SetMode => |sm| {
                 switch (sm) {
-                    .Text => |t| {
+                    .Text => {
                         std.log.info("set text to 80x25", .{});
-                        _ = c.SDL_RenderClear(renderer);
+                        _ = c.SDL_SetRenderTarget(renderer, gTexture);
+                        var x: usize = 0;
+                        while (x < 80) : (x += 1) {
+                            var y: usize = 0;
+                            while (y < 25) : (y += 1) {
+                                const pos = x+y*80;
+                                font.drawChar(x*8, y*16, screen[pos]);
+                            }
+                        }
+                        _ = c.SDL_SetRenderTarget(renderer, null);
                     },
                     .Graphics => |g| {
                         std.log.info("set graphics to {}x{}", .{g.width, g.height});
                         c.SDL_SetWindowSize(window, @intCast(c_int, g.width), @intCast(c_int, g.height));
-                        const vp = c.SDL_Rect {
-                            .x = 0, .y = 0,
-                            .w = @intCast(c_int, g.width), .h = @intCast(c_int, g.height)
-                        };
+                        renderLock.lock();
+                        defer renderLock.unlock();
                         gTexture = c.SDL_CreateTexture(renderer, c.SDL_PIXELFORMAT_RGB24, c.SDL_TEXTUREACCESS_TARGET,
                             @intCast(c_int, g.width), @intCast(c_int, g.height)) orelse unreachable;
                     }
                 }
             },
             .Fill => |cmd| {
-                //std.log.info("fill {}x{} rectangle at {}x{} with color {x}", .{cmd.w, cmd.h, cmd.x, cmd.y, cmd.rgb});
+                //std.log.debug("fill {}x{} rectangle at {}x{} with color {x}", .{cmd.w, cmd.h, cmd.x, cmd.y, cmd.rgb});
 
                 const rect = c.SDL_Rect {
                     .x = cmd.x, .y = cmd.y,
                     .w = cmd.w, .h = cmd.h
                 };
-                _ = c.SDL_RenderClear(renderer);
+
+                renderLock.lock();
+                defer renderLock.unlock();
+
                 _ = c.SDL_SetRenderTarget(renderer, gTexture);
                 _ = c.SDL_SetRenderDrawColor(renderer, @truncate(u8, cmd.rgb >> 16),
                     @truncate(u8, cmd.rgb >> 8), @truncate(u8, cmd.rgb), 0xFF);
                 _ = c.SDL_RenderFillRect(renderer, &rect);
                 _ = c.SDL_SetRenderTarget(renderer, null);
-                _ = c.SDL_RenderCopy(renderer, gTexture, null, null);
-                c.SDL_RenderPresent(renderer);
             }
         }
-    } else if (addr >= 0xB8000 and addr <= 0xB8000+0x4000) {
-        screen[addr - 0xB8000] = value;
-        if (currentMode == .Text) {
-            _ = c.SDL_RenderClear(renderer);
-            var x: usize = 0;
-            while (x < 80) : (x += 1) {
-                var y: usize = 0;
-                while (y < 25) : (y += 1) {
-                    const pos = x+y*80;
-                    font.drawChar(x*8, y*16, screen[pos]);
-                }
+    } else if (addr >= 0xB8000 and addr < 0xB8000+0x4000) {
+        const pos = (addr - 0xB8000 ) / 2;
+        if ((addr - 0xB8000) % 2 == 0) {
+            screen[pos] = value;
+            if (currentMode == .Text) {
+                const y = pos / 80;
+                const x = pos % 80;
+
+                renderLock.lock();
+                defer renderLock.unlock();
+
+                _ = c.SDL_SetRenderTarget(renderer, gTexture);
+                font.drawChar(x*8, y*16, screen[pos]);
+                _ = c.SDL_SetRenderTarget(renderer, null);
             }
-            c.SDL_RenderPresent(renderer);
         }
     } else {
         slice.*[addr] = value;
@@ -136,7 +146,7 @@ fn usage() !void {
 fn hartMain(hart: *cpu.Hart) !void {
     while (running) {
         hart.cycle();
-        std.time.sleep(1000000);
+        //std.time.sleep(20000);
     }
 }
 
@@ -175,8 +185,10 @@ pub fn main() anyerror!void {
         std.debug.warn("Could not open '{s}', got {s} error.\n", .{filePath, @errorName(err)});
         std.process.exit(1);
     };
-    var useSDL: bool = false;
     defer file.close();
+
+    var useSDL: bool = false;
+    _ = useSDL;
 
     // Allocate memory
     var ram = try allocator.alignedAlloc(u8, 16, 64 * 128 * 1024); // big alignment for better performance
@@ -184,8 +196,7 @@ pub fn main() anyerror!void {
     var memory = defaultMemory(&ram);
 
     // Read the ELF file
-    var header = try std.elf.readHeader(file);
-    const entry = header.entry;
+    var header = try std.elf.Header.read(file);
     var pIterator = header.program_header_iterator(file);
     while (try pIterator.next()) |phdr| {
         if (phdr.p_type == std.elf.PT_LOAD) {
@@ -217,7 +228,10 @@ pub fn main() anyerror!void {
     font = try loadHexFont(allocator, fontFile);
     fontFile.close();
 
-    var thread = try std.Thread.spawn(&hart, hartMain);
+    var thread = try std.Thread.spawn(.{}, hartMain, .{ &hart });
+
+    gTexture = c.SDL_CreateTexture(renderer, c.SDL_PIXELFORMAT_RGB24, c.SDL_TEXTUREACCESS_TARGET,
+        640, 400) orelse unreachable;
 
     while (true) {
         var event: c.SDL_Event = undefined;
@@ -230,10 +244,15 @@ pub fn main() anyerror!void {
                 memory.writeIntLittle(u16, 0xD0002, @intCast(u16, mouse.y));
             }
         }
-        //c.SDL_RenderPresent(renderer);
+
+        renderLock.lock();
+        defer renderLock.unlock();
+        _ = c.SDL_RenderClear(renderer);
+        _ = c.SDL_RenderCopy(renderer, gTexture, null, null);
+        c.SDL_RenderPresent(renderer);
     }
     running = false;
-    thread.wait();
+    thread.join();
 
     // Print the registers (x0-x31) as debug.
     var i: usize = 0;
@@ -250,7 +269,7 @@ const Font = struct {
     data: []u8,
 
     fn drawChar(self: *const Font, x: usize, y: usize, codePoint: u16) void {
-        const width = std.math.sqrt(self.total) * 8;
+        const width = std.math.sqrt(@intCast(u32, self.total)) * 8;
         const src = c.SDL_Rect {
             .x = (codePoint*8) % width, .y = ((codePoint * 8) / width) * 16,
             .w = 8, .h = 16
@@ -274,7 +293,7 @@ fn loadHexFont(allocator: *Allocator, file: std.fs.File) !Font {
         defer allocator.free(line);
         if (line.len == 0) break;
         total += 1;
-        var split = std.mem.split(line, ":");
+        var split = std.mem.split(u8, line, ":");
         const codePoint = try std.fmt.parseUnsigned(u16, split.next().?, 16);
         const bitmap = split.next().?;
         var charPixels: [16]u8 = undefined;
@@ -283,10 +302,13 @@ fn loadHexFont(allocator: *Allocator, file: std.fs.File) !Font {
             pixel.* = try std.fmt.parseUnsigned(u8, digits, 16);
         }
         totalBitmap = try allocator.realloc(totalBitmap, totalBitmap.len + 16);
+
+        // TODO: use codepoint info instead!! (codepoint is not always linear)
+        _ = codePoint;
         @memcpy(totalBitmap[totalBitmap.len-16..].ptr, &charPixels, charPixels.len);
     }
-    const width: usize = std.math.sqrt(total) * 8;
-    const height: usize = std.math.sqrt(total) * 16;
+    const width: usize = std.math.sqrt(@intCast(usize, total)) * 8;
+    const height: usize = std.math.sqrt(@intCast(usize, total)) * 16;
     var pixels: []u8 = try allocator.alloc(u8, width * height * 3);
     var i: usize = 0;
     var ix: usize = 0;
